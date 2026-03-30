@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import {
   clampDateStr,
   eachDateStrInRange,
   formatISODateLocal,
-  isValidISODate,
   parseISODateLocal
 } from '@/utils/ganttDates'
 import {
@@ -61,6 +60,8 @@ const showWeekday = ref(true)
 const tasks = ref<Task[]>([])
 const fileImport = ref<HTMLInputElement | null>(null)
 const ioMessage = ref('')
+/** 横向时间轴滚动容器（用于默认滚到「今天」或首个任务起点） */
+const scrollXRef = ref<HTMLElement | null>(null)
 
 /** 任务行上下排序（仅手柄可拖） */
 const rowReorderFromIndex = ref<number | null>(null)
@@ -231,6 +232,26 @@ function removeTask(id: string) {
   saveState()
 }
 
+/** 无任务时用今天起约三周；有任务时用所有任务日期的最小/最大边界 */
+function syncRangeFromTasks() {
+  if (tasks.value.length === 0) {
+    const r = defaultRange()
+    rangeStart.value = r.start
+    rangeEnd.value = r.end
+    return
+  }
+  let minD = tasks.value[0]!.start
+  let maxD = tasks.value[0]!.end
+  for (const t of tasks.value) {
+    const lo = t.start <= t.end ? t.start : t.end
+    const hi = t.start <= t.end ? t.end : t.start
+    if (lo < minD) minD = lo
+    if (hi > maxD) maxD = hi
+  }
+  rangeStart.value = minD
+  rangeEnd.value = maxD
+}
+
 function initDefaults() {
   const today = formatISODateLocal(new Date())
   const endD = parseISODateLocal(today)
@@ -355,25 +376,6 @@ function applyImported(
     ioMessage.value = '文件中没有有效的任务数据行。'
     return
   }
-  let rs = rangeStart.value
-  let re = rangeEnd.value
-  if (res.meta.rangeStart && isValidISODate(res.meta.rangeStart)) {
-    rs = res.meta.rangeStart
-  }
-  if (res.meta.rangeEnd && isValidISODate(res.meta.rangeEnd)) {
-    re = res.meta.rangeEnd
-  }
-  for (const r of res.rows) {
-    if (r.start < rs) rs = r.start
-    if (r.end > re) re = r.end
-  }
-  if (rs > re) {
-    const t = rs
-    rs = re
-    re = t
-  }
-  rangeStart.value = rs
-  rangeEnd.value = re
   if (typeof res.meta.showWeekday === 'boolean') {
     showWeekday.value = res.meta.showWeekday
   }
@@ -384,7 +386,7 @@ function applyImported(
     end: r.end,
     color: r.color || randomTaskColor()
   }))
-  clampAllTasksToRange()
+  syncRangeFromTasks()
   saveState()
   ioMessage.value = `已导入 ${res.rows.length} 条任务。`
 }
@@ -431,17 +433,63 @@ watch([rangeStart, rangeEnd], () => {
   }
   if (a && b) clampAllTasksToRange()
   saveState()
+  nextTick(() => scrollTimelineToAnchor())
 })
 
 watch(showWeekday, () => saveState())
+
+/** 今天在范围内则滚到今天，否则滚到第一个任务的开始日（无任务则到范围起点） */
+function scrollTimelineToAnchor() {
+  const el = scrollXRef.value
+  if (!el) return
+  const list = dateStrList.value
+  if (list.length === 0) return
+
+  const today = formatISODateLocal(new Date())
+  const rs = rangeStart.value
+  const re = rangeEnd.value
+  let target: string
+  if (today >= rs && today <= re) {
+    target = today
+  } else if (tasks.value.length > 0) {
+    const t0 = tasks.value[0]!
+    target = t0.start <= t0.end ? t0.start : t0.end
+  } else {
+    target = rs
+  }
+
+  const idx = list.indexOf(target)
+  el.scrollLeft = idx >= 0 ? idx * CELL : 0
+}
+
+/** 任务起止日变化时收紧/扩展横轴范围（与手动改日期输入无关） */
+watch(
+  () => tasks.value.map((t) => `${t.start}|${t.end}`).join(';'),
+  () => {
+    syncRangeFromTasks()
+    nextTick(() => scrollTimelineToAnchor())
+  },
+  { flush: 'post' }
+)
+
+/** 仅调整任务顺序时，锚点「第一个任务」可能变化，需重算滚动 */
+watch(
+  () => tasks.value.map((t) => t.id).join(','),
+  () => {
+    nextTick(() => scrollTimelineToAnchor())
+  },
+  { flush: 'post' }
+)
 
 onMounted(() => {
   if (!loadState()) {
     initDefaults()
     saveState()
   } else {
+    syncRangeFromTasks()
     clampAllTasksToRange()
   }
+  nextTick(() => scrollTimelineToAnchor())
 })
 </script>
 
@@ -523,7 +571,7 @@ onMounted(() => {
           </button>
         </div>
       </div>
-      <div class="scroll-x">
+      <div ref="scrollXRef" class="scroll-x">
         <div class="timeline-header" :style="{ width: `${timelineWidthPx}px` }">
           <div
             v-for="d in days"
