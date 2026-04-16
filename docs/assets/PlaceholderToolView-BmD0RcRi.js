@@ -1,1 +1,0 @@
-import{_ as a,c,b as o,a as s}from"./index-C1C_kXg7.js";const t={},l={class:"placeholder"};function r(n,e){return s(),c("div",l,[...e[0]||(e[0]=[o("h1",null,"更多工具即将上线",-1),o("p",null,"此页面用于演示工具注册流程，后续可替换为具体功能。",-1)])])}const d=a(t,[["render",r],["__scopeId","data-v-55e7fc8a"]]);export{d as default};

@@ -61,14 +61,14 @@
 
 ## 里程碑：哈希路由与移动端布局（2026-03-25）
 
-**目标**：GitHub Pages 子路径下使用哈希路由（`/tools/#/…`）；修正模板遗留断点导致的窄屏布局问题；E2E 与 `base: '/tools/'` 对齐。
+**目标**：GitHub Pages 子路径下使用哈希路由（`/tool/#/…`）；修正模板遗留断点导致的窄屏布局问题；E2E 与 `base: '/tool/'` 对齐。
 
 ### 任务清单
 
 - [x] [`src/router/index.ts`](../../src/router/index.ts)：`createWebHashHistory(import.meta.env.BASE_URL)`
 - [x] [`src/assets/main.css`](../../src/assets/main.css)：去掉 `min-width: 1024px` 下 `body`/`#app` 双栏网格；采用 640px / 1024px 渐进式 `#app` 内边距
 - [x] 各页面容器：水平留白交给 `#app`，避免与组件内 `padding` 重复
-- [x] [`cypress.config.ts`](../../cypress.config.ts) 与 [`package.json`](../../package.json) 中 e2e 等待地址改为 `http://localhost:4173/tools`
+- [x] [`cypress.config.ts`](../../cypress.config.ts) 与 [`package.json`](../../package.json) 中 e2e 等待地址改为 `http://localhost:4173/tool`
 - [x] 文档：`project-context`、本文件、[`changelog/2026-03-25-hash-router-layout.md`](../changelog/2026-03-25-hash-router-layout.md)
 
 ---
@@ -104,7 +104,7 @@
 
 ### 说明
 
-- 数据存 `localStorage` 键 `tools-gantt-v1`；清除站点数据会丢失。
+- 数据存 `localStorage` 键 `tool-gantt-v1`（首次加载会自 `tools-gantt-v1` 迁移）；清除站点数据会丢失。
 - 色块拖拽依赖 Pointer Events；窄屏可横向滚动时间轴。
 - 导出/导入：CSV（UTF-8 BOM）与 Excel（`xlsx`）；见 [`src/utils/ganttIo.ts`](../../src/utils/ganttIo.ts)。
 - 任务行左侧拖动手柄：HTML5 拖放调整顺序（左侧行与右侧轨道均可作为释放目标）。

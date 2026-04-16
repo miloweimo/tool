@@ -1,10 +1,13 @@
-export const THEME_STORAGE_KEY = 'tools-theme'
+export const THEME_STORAGE_KEY = 'tool-theme'
+
+const LEGACY_THEME_STORAGE_KEY = 'tools-theme'
 
 export type ThemePreference = 'light' | 'dark'
 
 export function getStoredTheme(): ThemePreference | null {
   try {
-    const v = localStorage.getItem(THEME_STORAGE_KEY)
+    let v = localStorage.getItem(THEME_STORAGE_KEY)
+    if (v !== 'light' && v !== 'dark') v = localStorage.getItem(LEGACY_THEME_STORAGE_KEY)
     if (v === 'light' || v === 'dark') return v
   } catch {
     /* ignore */
@@ -28,6 +31,7 @@ export function isEffectiveDark(stored: ThemePreference | null): boolean {
 export function setStoredTheme(mode: ThemePreference): void {
   try {
     localStorage.setItem(THEME_STORAGE_KEY, mode)
+    localStorage.removeItem(LEGACY_THEME_STORAGE_KEY)
   } catch {
     /* ignore */
   }

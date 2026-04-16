@@ -3,8 +3,11 @@ import {
   THEME_STORAGE_KEY,
   getStoredTheme,
   isEffectiveDark,
-  applyThemeToDocument
+  applyThemeToDocument,
+  setStoredTheme
 } from '../theme'
+
+const LEGACY_THEME_KEY = 'tools-theme'
 
 describe('theme', () => {
   beforeEach(() => {
@@ -22,6 +25,18 @@ describe('theme', () => {
   it('getStoredTheme returns null for unknown', () => {
     localStorage.setItem(THEME_STORAGE_KEY, 'auto')
     expect(getStoredTheme()).toBe(null)
+  })
+
+  it('getStoredTheme reads legacy key when new key missing', () => {
+    localStorage.setItem(LEGACY_THEME_KEY, 'dark')
+    expect(getStoredTheme()).toBe('dark')
+  })
+
+  it('setStoredTheme writes new key and removes legacy', () => {
+    localStorage.setItem(LEGACY_THEME_KEY, 'light')
+    setStoredTheme('dark')
+    expect(localStorage.getItem(LEGACY_THEME_KEY)).toBeNull()
+    expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe('dark')
   })
 
   it('applyThemeToDocument sets data-theme', () => {

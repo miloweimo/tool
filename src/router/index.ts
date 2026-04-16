@@ -11,7 +11,7 @@ const toolRoutes: RouteRecordRaw[] = tools.map((t) => ({
 }))
 
 const router = createRouter({
-  // 哈希路由：适合 GitHub Pages 子路径部署，形如 https://user.github.io/tools/#/camera-mirror
+  // 哈希路由：适合 GitHub Pages 子路径部署，形如 https://user.github.io/tool/#/camera-mirror
   history: createWebHashHistory(import.meta.env.BASE_URL),
   routes: [
     {

@@ -15,7 +15,8 @@ import {
 } from '@/utils/ganttIo'
 
 const CELL = 34
-const STORAGE_KEY = 'tools-gantt-v1'
+const STORAGE_KEY = 'tool-gantt-v1'
+const LEGACY_STORAGE_KEY = 'tools-gantt-v1'
 const WEEK_ZH = ['日', '一', '二', '三', '四', '五', '六'] as const
 
 interface Task {
@@ -278,7 +279,9 @@ function initDefaults() {
 
 function loadState(): boolean {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const fromNew = localStorage.getItem(STORAGE_KEY)
+    const fromLegacy = localStorage.getItem(LEGACY_STORAGE_KEY)
+    const raw = fromNew ?? fromLegacy
     if (!raw) return false
     const o = JSON.parse(raw) as {
       rangeStart?: string
@@ -303,6 +306,10 @@ function loadState(): boolean {
       }))
     } else {
       tasks.value = []
+    }
+    if (!fromNew && fromLegacy) {
+      localStorage.setItem(STORAGE_KEY, raw)
+      localStorage.removeItem(LEGACY_STORAGE_KEY)
     }
     return true
   } catch {
