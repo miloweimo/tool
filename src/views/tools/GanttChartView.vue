@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import {
-  clampDateStr,
   eachDateStrInRange,
   formatISODateLocal,
+  isValidISODate,
   parseISODateLocal
 } from '@/utils/ganttDates'
 import {
@@ -18,6 +18,17 @@ const CELL = 34
 const STORAGE_KEY = 'tool-gantt-v1'
 const LEGACY_STORAGE_KEY = 'tools-gantt-v1'
 const WEEK_ZH = ['日', '一', '二', '三', '四', '五', '六'] as const
+/** 初次进入时视口：今天向左、向右各延伸天数（可继续滚动扩展） */
+const VIEWPORT_BACK_DAYS = 45
+const VIEWPORT_FORWARD_DAYS = 200
+/** 滚到左右边缘时一次追加的天数 */
+const EXTEND_CHUNK_DAYS = 45
+/** 任务条、导入后视口比任务多留的空档 */
+const TASK_PAD_DAYS = 14
+const SCROLL_EDGE_PX = CELL * 10
+/** 拖拽时指针贴近滚动区左右缘则自动滚时间轴（px） */
+const DRAG_AUTOSCROLL_MARGIN_PX = 48
+const DRAG_AUTOSCROLL_STEP_PX = 16
 
 interface Task {
   id: string
@@ -30,10 +41,13 @@ interface Task {
 interface DragState {
   taskId: string
   mode: 'move' | 'resize-left' | 'resize-right'
+  /** 保留：与其它逻辑兼容；平移模式主要用 grabOffsetCells + 指针映射 */
   startClientX: number
   origStartIdx: number
   origEndIdx: number
   pointerId: number
+  /** 平移：按下时指针所在列索引 − 任务条起点列索引 */
+  grabOffsetCells?: number
 }
 
 function randomTaskColor(): string {
@@ -47,22 +61,29 @@ function addDaysStr(s: string, n: number): string {
   return formatISODateLocal(d)
 }
 
-function defaultRange(): { start: string; end: string } {
-  const today = formatISODateLocal(new Date())
-  const endD = parseISODateLocal(today)
-  endD.setDate(endD.getDate() + 20)
-  return { start: today, end: formatISODateLocal(endD) }
+function todayIso(): string {
+  return formatISODateLocal(new Date())
 }
 
-const dr = defaultRange()
-const rangeStart = ref(dr.start)
-const rangeEnd = ref(dr.end)
+function initViewportAroundToday() {
+  const t = todayIso()
+  viewportStart.value = addDaysStr(t, -VIEWPORT_BACK_DAYS)
+  viewportEnd.value = addDaysStr(t, VIEWPORT_FORWARD_DAYS)
+}
+
+const viewportStart = ref('')
+const viewportEnd = ref('')
+initViewportAroundToday()
 const showWeekday = ref(true)
 const tasks = ref<Task[]>([])
 const fileImport = ref<HTMLInputElement | null>(null)
 const ioMessage = ref('')
+/** 导航「本条结束 / 下一条开始」所参照的任务；为 null 时视为第一条 */
+const navContextTaskId = ref<string | null>(null)
 /** 横向时间轴滚动容器（用于默认滚到「今天」或首个任务起点） */
 const scrollXRef = ref<HTMLElement | null>(null)
+/** 防止滚动触边时连续重复扩展视口 */
+const scrollExtendBusy = ref(false)
 
 /** 任务行上下排序（仅手柄可拖） */
 const rowReorderFromIndex = ref<number | null>(null)
@@ -104,12 +125,39 @@ function onRowDragEnd() {
   rowReorderOverIndex.value = null
 }
 
+function setNavContextTask(id: string) {
+  navContextTaskId.value = id
+}
+
+function resolveNavContextTask(): Task | null {
+  if (tasks.value.length === 0) return null
+  const id = navContextTaskId.value
+  if (id) {
+    const t = tasks.value.find((x) => x.id === id)
+    if (t) return t
+  }
+  return tasks.value[0] ?? null
+}
+
+function navContextTaskIndex(): number {
+  const t = resolveNavContextTask()
+  if (!t) return -1
+  return tasks.value.findIndex((x) => x.id === t.id)
+}
+
+function isNavContextRow(taskId: string): boolean {
+  if (tasks.value.length === 0) return false
+  const id = navContextTaskId.value ?? tasks.value[0]!.id
+  return taskId === id
+}
+
 const days = computed(() => {
-  const list = eachDateStrInRange(rangeStart.value, rangeEnd.value)
+  const list = eachDateStrInRange(viewportStart.value, viewportEnd.value)
   return list.map((dateStr) => {
     const d = parseISODateLocal(dateStr)
     return {
       dateStr,
+      /** 统一为 月/日，如 3/24、12/1（不补零） */
       monthDay: `${d.getMonth() + 1}/${d.getDate()}`,
       weekZh: WEEK_ZH[d.getDay()]!
     }
@@ -137,44 +185,188 @@ function barWidthPx(task: Task): number {
 }
 
 const dragState = ref<DragState | null>(null)
+const lastDragPointer = ref<PointerEvent | null>(null)
+let dragAutoscrollRaf = 0
+
+function formatMdFromIso(iso: string): string {
+  const d = parseISODateLocal(iso)
+  return `${d.getMonth() + 1}/${d.getDate()}`
+}
+
+function orderedTaskBounds(task: Task): { lo: string; hi: string } {
+  return task.start <= task.end
+    ? { lo: task.start, hi: task.end }
+    : { lo: task.end, hi: task.start }
+}
+
+function barTooltip(task: Task): string {
+  const { lo, hi } = orderedTaskBounds(task)
+  const title = task.title.trim() || '（未命名任务）'
+  return `${title}  ${formatMdFromIso(lo)} — ${formatMdFromIso(hi)}`
+}
+
+function barInlineLabel(task: Task): string {
+  const { lo, hi } = orderedTaskBounds(task)
+  return `${formatMdFromIso(lo)}–${formatMdFromIso(hi)} ${task.title}`
+}
+
+/** 在时间轴左侧追加若干天，并补偿滚动与拖拽中的索引，避免视口跳动 */
+function prependTimelineDays(count: number) {
+  if (count <= 0) return
+  viewportStart.value = addDaysStr(viewportStart.value, -count)
+  const st = dragState.value
+  if (st) {
+    st.origStartIdx += count
+    st.origEndIdx += count
+  }
+  nextTick(() => {
+    const el = scrollXRef.value
+    if (el) el.scrollLeft += count * CELL
+  })
+}
+
+function appendTimelineDays(count: number) {
+  if (count <= 0) return
+  viewportEnd.value = addDaysStr(viewportEnd.value, count)
+}
+
+/** 指针相对时间轴滚动内容区的列索引（0 = 视口内第一列） */
+function clientXToTimelineDayIndex(clientX: number): number {
+  const el = scrollXRef.value
+  if (!el) return 0
+  const r = el.getBoundingClientRect()
+  const x = clientX - r.left + el.scrollLeft
+  return Math.floor(x / CELL)
+}
+
+function cancelDragAutoscroll() {
+  if (dragAutoscrollRaf) {
+    cancelAnimationFrame(dragAutoscrollRaf)
+    dragAutoscrollRaf = 0
+  }
+}
+
+function isPointerInDragAutoscrollZone(clientX: number): 'left' | 'right' | null {
+  const el = scrollXRef.value
+  if (!el) return null
+  const r = el.getBoundingClientRect()
+  if (clientX <= r.left + DRAG_AUTOSCROLL_MARGIN_PX) return 'left'
+  if (clientX >= r.right - DRAG_AUTOSCROLL_MARGIN_PX) return 'right'
+  return null
+}
+
+/** 贴边时持续滚时间轴；同一指针不动也能因 scrollLeft 变化而更新落点列 */
+function dragAutoscrollTick() {
+  dragAutoscrollRaf = 0
+  const st = dragState.value
+  const ev = lastDragPointer.value
+  if (!st || !ev) return
+
+  applyDrag(ev)
+
+  const el = scrollXRef.value
+  if (!el) return
+
+  const zone = isPointerInDragAutoscrollZone(ev.clientX)
+  let needNext = false
+
+  /** 左缘、右缘贴边均触发滚动：三种拖拽（左柄、右柄、整块）在两侧都能继续拖出视口 */
+  if (zone === 'left') {
+    if (el.scrollLeft > 0) {
+      el.scrollLeft = Math.max(0, el.scrollLeft - DRAG_AUTOSCROLL_STEP_PX)
+      needNext = true
+    } else {
+      prependTimelineDays(12)
+      needNext = true
+    }
+  } else if (zone === 'right') {
+    const maxSl = el.scrollWidth - el.clientWidth
+    if (el.scrollLeft < maxSl - 1) {
+      el.scrollLeft = Math.min(maxSl, el.scrollLeft + DRAG_AUTOSCROLL_STEP_PX)
+      needNext = true
+    } else {
+      appendTimelineDays(12)
+      needNext = true
+    }
+  }
+
+  if (needNext && dragState.value) {
+    dragAutoscrollRaf = requestAnimationFrame(dragAutoscrollTick)
+  }
+}
+
+function scheduleDragAutoscroll() {
+  if (dragAutoscrollRaf || !dragState.value || !lastDragPointer.value) return
+  const z = isPointerInDragAutoscrollZone(lastDragPointer.value.clientX)
+  if (z === 'left' || z === 'right') {
+    dragAutoscrollRaf = requestAnimationFrame(dragAutoscrollTick)
+  }
+}
 
 function applyDrag(e: PointerEvent) {
   const st = dragState.value
   if (!st) return
-  const task = tasks.value.find((t) => t.id === st.taskId)
-  if (!task) return
-  const list = dateStrList.value
-  const n = list.length
-  if (n === 0) return
+  let guard = 0
+  while (guard++ < 48) {
+    const task = tasks.value.find((t) => t.id === st.taskId)
+    if (!task) return
+    const list = dateStrList.value
+    const n = list.length
+    if (n === 0) return
 
-  const dDays = Math.round((e.clientX - st.startClientX) / CELL)
-  const { mode, origStartIdx, origEndIdx } = st
+    const { mode, origStartIdx, origEndIdx } = st
 
-  if (mode === 'move') {
-    const dur = origEndIdx - origStartIdx
-    let ns = origStartIdx + dDays
-    ns = Math.max(0, Math.min(ns, n - 1 - dur))
-    const ne = ns + dur
-    task.start = list[ns]!
-    task.end = list[ne]!
-  } else if (mode === 'resize-left') {
-    let ns = origStartIdx + dDays
-    ns = Math.max(0, Math.min(ns, origEndIdx))
-    task.start = list[ns]!
-  } else {
-    let ne = origEndIdx + dDays
+    if (mode === 'move') {
+      const dur = origEndIdx - origStartIdx
+      const grab = st.grabOffsetCells ?? 0
+      let ns = clientXToTimelineDayIndex(e.clientX) - grab
+      if (ns < 0) {
+        prependTimelineDays(-ns + 5)
+        continue
+      }
+      if (ns + dur > n - 1) {
+        appendTimelineDays(ns + dur - (n - 1) + 5)
+        continue
+      }
+      ns = Math.max(0, Math.min(ns, n - 1 - dur))
+      const ne = ns + dur
+      task.start = list[ns]!
+      task.end = list[ne]!
+      return
+    }
+    if (mode === 'resize-left') {
+      let ns = clientXToTimelineDayIndex(e.clientX)
+      if (ns < 0) {
+        prependTimelineDays(-ns + 5)
+        continue
+      }
+      ns = Math.max(0, Math.min(ns, origEndIdx))
+      task.start = list[ns]!
+      return
+    }
+    let ne = clientXToTimelineDayIndex(e.clientX)
+    if (ne > n - 1) {
+      appendTimelineDays(ne - (n - 1) + 5)
+      continue
+    }
     ne = Math.max(origStartIdx, Math.min(ne, n - 1))
     task.end = list[ne]!
+    return
   }
 }
 
 function onPointerMove(e: PointerEvent) {
+  lastDragPointer.value = e
   applyDrag(e)
+  cancelDragAutoscroll()
+  scheduleDragAutoscroll()
 }
 
 function onPointerUp(e: PointerEvent) {
   const st = dragState.value
   const el = e.currentTarget as HTMLElement
+  cancelDragAutoscroll()
+  lastDragPointer.value = null
   if (st) {
     try {
       el.releasePointerCapture(st.pointerId)
@@ -190,17 +382,21 @@ function onPointerUp(e: PointerEvent) {
 function onBarPointerDown(e: PointerEvent, task: Task, mode: DragState['mode']) {
   if (e.button !== 0) return
   e.preventDefault()
+  navContextTaskId.value = task.id
+  ensureViewportCoversTasks()
   const si = dayIndex(task.start)
   const ei = dayIndex(task.end)
   if (si < 0 || ei < 0) return
 
+  const ptrCol = clientXToTimelineDayIndex(e.clientX)
   dragState.value = {
     taskId: task.id,
     mode,
     startClientX: e.clientX,
     origStartIdx: si,
     origEndIdx: ei,
-    pointerId: e.pointerId
+    pointerId: e.pointerId,
+    grabOffsetCells: mode === 'move' ? ptrCol - si : undefined
   }
   const el = e.currentTarget as HTMLElement
   el.setPointerCapture(e.pointerId)
@@ -210,21 +406,27 @@ function onBarPointerDown(e: PointerEvent, task: Task, mode: DragState['mode']) 
 }
 
 function addTask() {
-  const min = rangeStart.value
-  const max = rangeEnd.value
+  const tday = todayIso()
+  if (tday < viewportStart.value) viewportStart.value = addDaysStr(tday, -TASK_PAD_DAYS)
+  if (tday > viewportEnd.value) viewportEnd.value = addDaysStr(tday, TASK_PAD_DAYS)
+  ensureViewportCoversTasks()
   const list = dateStrList.value
   if (list.length === 0) return
-  let s = min
-  let e = addDaysStr(s, Math.min(2, list.length - 1))
-  e = clampDateStr(e, min, max)
+  const si = dayIndex(tday)
+  const s = si >= 0 ? tday : viewportStart.value
+  const si2 = dayIndex(s)
+  const span = Math.min(2, Math.max(0, list.length - 1 - si2))
+  let e = addDaysStr(s, span)
   if (s > e) e = s
+  const nid = crypto.randomUUID()
   tasks.value.push({
-    id: crypto.randomUUID(),
+    id: nid,
     title: '新任务',
     start: s,
     end: e,
     color: randomTaskColor()
   })
+  navContextTaskId.value = nid
   saveState()
 }
 
@@ -233,14 +435,9 @@ function removeTask(id: string) {
   saveState()
 }
 
-/** 无任务时用今天起约三周；有任务时用所有任务日期的最小/最大边界 */
-function syncRangeFromTasks() {
-  if (tasks.value.length === 0) {
-    const r = defaultRange()
-    rangeStart.value = r.start
-    rangeEnd.value = r.end
-    return
-  }
+/** 仅扩展视口以包含所有任务（不收缩），避免任务条落在网格外 */
+function ensureViewportCoversTasks() {
+  if (tasks.value.length === 0) return
   let minD = tasks.value[0]!.start
   let maxD = tasks.value[0]!.end
   for (const t of tasks.value) {
@@ -249,16 +446,15 @@ function syncRangeFromTasks() {
     if (lo < minD) minD = lo
     if (hi > maxD) maxD = hi
   }
-  rangeStart.value = minD
-  rangeEnd.value = maxD
+  const padStart = addDaysStr(minD, -TASK_PAD_DAYS)
+  const padEnd = addDaysStr(maxD, TASK_PAD_DAYS)
+  if (padStart < viewportStart.value) viewportStart.value = padStart
+  if (padEnd > viewportEnd.value) viewportEnd.value = padEnd
 }
 
 function initDefaults() {
-  const today = formatISODateLocal(new Date())
-  const endD = parseISODateLocal(today)
-  endD.setDate(endD.getDate() + 20)
-  rangeStart.value = today
-  rangeEnd.value = formatISODateLocal(endD)
+  const today = todayIso()
+  initViewportAroundToday()
   tasks.value = [
     {
       id: crypto.randomUUID(),
@@ -275,6 +471,7 @@ function initDefaults() {
       color: randomTaskColor()
     }
   ]
+  navContextTaskId.value = tasks.value[0]!.id
 }
 
 function loadState(): boolean {
@@ -284,29 +481,40 @@ function loadState(): boolean {
     const raw = fromNew ?? fromLegacy
     if (!raw) return false
     const o = JSON.parse(raw) as {
+      viewportStart?: string
+      viewportEnd?: string
       rangeStart?: string
       rangeEnd?: string
       showWeekday?: boolean
       tasks?: Task[]
     }
-    if (o.rangeStart && o.rangeEnd) {
-      rangeStart.value = o.rangeStart
-      rangeEnd.value = o.rangeEnd
+    if (o.viewportStart && o.viewportEnd) {
+      viewportStart.value = o.viewportStart
+      viewportEnd.value = o.viewportEnd
+    } else if (o.rangeStart && o.rangeEnd) {
+      viewportStart.value = o.rangeStart
+      viewportEnd.value = o.rangeEnd
     } else {
-      return false
+      initViewportAroundToday()
+    }
+    if (!isValidISODate(viewportStart.value) || !isValidISODate(viewportEnd.value)) {
+      initViewportAroundToday()
     }
     if (typeof o.showWeekday === 'boolean') showWeekday.value = o.showWeekday
+    const fallbackStart = o.viewportStart ?? o.rangeStart ?? viewportStart.value
+    const fallbackEnd = o.viewportEnd ?? o.rangeEnd ?? viewportEnd.value
     if (Array.isArray(o.tasks) && o.tasks.length > 0) {
       tasks.value = o.tasks.map((t) => ({
         id: typeof t.id === 'string' ? t.id : crypto.randomUUID(),
         title: typeof t.title === 'string' ? t.title : '任务',
-        start: typeof t.start === 'string' ? t.start : o.rangeStart!,
-        end: typeof t.end === 'string' ? t.end : o.rangeEnd!,
+        start: typeof t.start === 'string' ? t.start : fallbackStart,
+        end: typeof t.end === 'string' ? t.end : fallbackEnd,
         color: typeof t.color === 'string' ? t.color : randomTaskColor()
       }))
     } else {
       tasks.value = []
     }
+    navContextTaskId.value = tasks.value[0]?.id ?? null
     if (!fromNew && fromLegacy) {
       localStorage.setItem(STORAGE_KEY, raw)
       localStorage.removeItem(LEGACY_STORAGE_KEY)
@@ -322,8 +530,8 @@ function saveState() {
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
-        rangeStart: rangeStart.value,
-        rangeEnd: rangeEnd.value,
+        viewportStart: viewportStart.value,
+        viewportEnd: viewportEnd.value,
         showWeekday: showWeekday.value,
         tasks: tasks.value
       })
@@ -342,29 +550,36 @@ function exportTasksPayload() {
   }))
 }
 
+function exportMetaRange(): { start: string; end: string } {
+  if (tasks.value.length === 0) {
+    return { start: viewportStart.value, end: viewportEnd.value }
+  }
+  let minD = tasks.value[0]!.start
+  let maxD = tasks.value[0]!.end
+  for (const t of tasks.value) {
+    const lo = t.start <= t.end ? t.start : t.end
+    const hi = t.start <= t.end ? t.end : t.start
+    if (lo < minD) minD = lo
+    if (hi > maxD) maxD = hi
+  }
+  return {
+    start: addDaysStr(minD, -TASK_PAD_DAYS),
+    end: addDaysStr(maxD, TASK_PAD_DAYS)
+  }
+}
+
 function exportCsvFile() {
-  const csv = buildCsv(
-    rangeStart.value,
-    rangeEnd.value,
-    showWeekday.value,
-    exportTasksPayload()
-  )
-  downloadBlob(
-    `gantt-${rangeStart.value}_${rangeEnd.value}.csv`,
-    new Blob([csv], { type: 'text/csv;charset=utf-8' })
-  )
+  const { start, end } = exportMetaRange()
+  const csv = buildCsv(start, end, showWeekday.value, exportTasksPayload())
+  downloadBlob(`gantt-${start}_${end}.csv`, new Blob([csv], { type: 'text/csv;charset=utf-8' }))
   ioMessage.value = ''
 }
 
 function exportXlsxFile() {
-  const buf = buildXlsxBuffer(
-    rangeStart.value,
-    rangeEnd.value,
-    showWeekday.value,
-    exportTasksPayload()
-  )
+  const { start, end } = exportMetaRange()
+  const buf = buildXlsxBuffer(start, end, showWeekday.value, exportTasksPayload())
   downloadBlob(
-    `gantt-${rangeStart.value}_${rangeEnd.value}.xlsx`,
+    `gantt-${start}_${end}.xlsx`,
     new Blob([buf], {
       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     })
@@ -393,9 +608,11 @@ function applyImported(
     end: r.end,
     color: r.color || randomTaskColor()
   }))
-  syncRangeFromTasks()
+  ensureViewportCoversTasks()
+  navContextTaskId.value = tasks.value[0]?.id ?? null
   saveState()
   ioMessage.value = `已导入 ${res.rows.length} 条任务。`
+  nextTick(() => scrollTimelineToAnchor())
 }
 
 async function onImportFileChange(e: Event) {
@@ -420,72 +637,119 @@ async function onImportFileChange(e: Event) {
   input.value = ''
 }
 
-function clampAllTasksToRange() {
-  const min = rangeStart.value
-  const max = rangeEnd.value
-  for (const t of tasks.value) {
-    let s = clampDateStr(t.start, min, max)
-    let e = clampDateStr(t.end, min, max)
-    if (s > e) e = s
-    t.start = s
-    t.end = e
+watch([viewportStart, viewportEnd], () => {
+  const a = viewportStart.value
+  const b = viewportEnd.value
+  if (a && b && a > b) {
+    viewportEnd.value = a
+  }
+  saveState()
+})
+
+function onScrollTimeline() {
+  if (scrollExtendBusy.value) return
+  const el = scrollXRef.value
+  if (!el) return
+  if (el.scrollLeft < SCROLL_EDGE_PX) {
+    scrollExtendBusy.value = true
+    prependTimelineDays(EXTEND_CHUNK_DAYS)
+    nextTick(() => {
+      scrollExtendBusy.value = false
+    })
+  } else if (el.scrollLeft + el.clientWidth > el.scrollWidth - SCROLL_EDGE_PX) {
+    scrollExtendBusy.value = true
+    appendTimelineDays(EXTEND_CHUNK_DAYS)
+    nextTick(() => {
+      scrollExtendBusy.value = false
+    })
   }
 }
-
-watch([rangeStart, rangeEnd], () => {
-  const a = rangeStart.value
-  const b = rangeEnd.value
-  if (a && b && a > b) {
-    rangeEnd.value = a
-  }
-  if (a && b) clampAllTasksToRange()
-  saveState()
-  nextTick(() => scrollTimelineToAnchor())
-})
 
 watch(showWeekday, () => saveState())
 
-/** 今天在范围内则滚到今天，否则滚到第一个任务的开始日（无任务则到范围起点） */
-function scrollTimelineToAnchor() {
-  const el = scrollXRef.value
-  if (!el) return
-  const list = dateStrList.value
-  if (list.length === 0) return
-
-  const today = formatISODateLocal(new Date())
-  const rs = rangeStart.value
-  const re = rangeEnd.value
-  let target: string
-  if (today >= rs && today <= re) {
-    target = today
-  } else if (tasks.value.length > 0) {
-    const t0 = tasks.value[0]!
-    target = t0.start <= t0.end ? t0.start : t0.end
-  } else {
-    target = rs
-  }
-
-  const idx = list.indexOf(target)
-  el.scrollLeft = idx >= 0 ? idx * CELL : 0
+/** 将某日期滚入视口（先扩展视口以包含该日） */
+function scrollTimelineToDate(iso: string) {
+  if (!isValidISODate(iso)) return
+  if (iso < viewportStart.value) viewportStart.value = addDaysStr(iso, -TASK_PAD_DAYS)
+  if (iso > viewportEnd.value) viewportEnd.value = addDaysStr(iso, TASK_PAD_DAYS)
+  ensureViewportCoversTasks()
+  nextTick(() => {
+    const list = dateStrList.value
+    const el = scrollXRef.value
+    if (!el || list.length === 0) return
+    const idx = list.indexOf(iso)
+    if (idx < 0) return
+    el.scrollLeft = Math.max(0, idx * CELL - el.clientWidth * 0.22)
+  })
 }
 
-/** 任务起止日变化时收紧/扩展横轴范围（与手动改日期输入无关） */
+/** 默认锚定到今天；若今天在视口外则先扩展再滚动 */
+function scrollTimelineToAnchor() {
+  scrollTimelineToDate(todayIso())
+}
+
+function scrollToEarliestTaskStart() {
+  if (tasks.value.length === 0) {
+    ioMessage.value = '暂无任务。'
+    return
+  }
+  let best = tasks.value[0]!
+  let bestLo = orderedTaskBounds(best).lo
+  for (const t of tasks.value) {
+    const lo = orderedTaskBounds(t).lo
+    if (lo < bestLo) {
+      bestLo = lo
+      best = t
+    }
+  }
+  navContextTaskId.value = best.id
+  scrollTimelineToDate(bestLo)
+  ioMessage.value = ''
+}
+
+function scrollToContextTaskEnd() {
+  const t = resolveNavContextTask()
+  if (!t) {
+    ioMessage.value = '暂无任务。'
+    return
+  }
+  const { hi } = orderedTaskBounds(t)
+  scrollTimelineToDate(hi)
+  ioMessage.value = ''
+}
+
+function scrollToNextTaskStart() {
+  const i = navContextTaskIndex()
+  if (i < 0 || i >= tasks.value.length - 1) {
+    ioMessage.value = '没有下一条任务。'
+    return
+  }
+  const next = tasks.value[i + 1]!
+  navContextTaskId.value = next.id
+  scrollTimelineToDate(orderedTaskBounds(next).lo)
+  ioMessage.value = ''
+}
+
+function canScrollToNextTaskStart(): boolean {
+  const i = navContextTaskIndex()
+  return i >= 0 && i < tasks.value.length - 1
+}
+
 watch(
   () => tasks.value.map((t) => `${t.start}|${t.end}`).join(';'),
   () => {
-    syncRangeFromTasks()
-    nextTick(() => scrollTimelineToAnchor())
+    ensureViewportCoversTasks()
   },
   { flush: 'post' }
 )
 
-/** 仅调整任务顺序时，锚点「第一个任务」可能变化，需重算滚动 */
 watch(
   () => tasks.value.map((t) => t.id).join(','),
   () => {
-    nextTick(() => scrollTimelineToAnchor())
-  },
-  { flush: 'post' }
+    if (navContextTaskId.value && !tasks.value.some((t) => t.id === navContextTaskId.value)) {
+      navContextTaskId.value = tasks.value[0]?.id ?? null
+    }
+  }
 )
 
 onMounted(() => {
@@ -493,8 +757,7 @@ onMounted(() => {
     initDefaults()
     saveState()
   } else {
-    syncRangeFromTasks()
-    clampAllTasksToRange()
+    ensureViewportCoversTasks()
   }
   nextTick(() => scrollTimelineToAnchor())
 })
@@ -505,23 +768,44 @@ onMounted(() => {
     <header class="head">
       <h1>甘特图</h1>
       <p class="lead">
-        横轴为日期、纵轴为任务；可拖拽色块整体平移或拉左右边调整起止日；任务行左侧手柄可拖动排序。支持导出/导入 CSV 与 Excel；数据保存在本机浏览器。
+        横轴为日期（向左右滚动可不断延伸时间轴），纵轴为任务；可拖拽色块整体平移或拉左右边调整起止日；任务行左侧手柄可拖动排序。支持导出/导入 CSV 与
+        Excel；数据保存在本机浏览器。
       </p>
     </header>
 
-    <section class="toolbar" aria-label="时间范围与选项">
-      <label class="field">
-        <span class="label">起始</span>
-        <input v-model="rangeStart" type="date" class="date-inp" />
-      </label>
-      <label class="field">
-        <span class="label">结束</span>
-        <input v-model="rangeEnd" type="date" class="date-inp" />
-      </label>
+    <section class="toolbar" aria-label="选项与导航">
       <label class="field check">
         <input v-model="showWeekday" type="checkbox" />
         <span>显示星期</span>
       </label>
+      <button type="button" class="btn" @click="scrollTimelineToAnchor">回到今天</button>
+      <button
+        type="button"
+        class="btn"
+        title="滚动到所有任务里最早的开始日，并将该任务设为导航上下文"
+        :disabled="tasks.length === 0"
+        @click="scrollToEarliestTaskStart"
+      >
+        最早开始
+      </button>
+      <button
+        type="button"
+        class="btn"
+        title="滚动到当前上下文任务的结束日（点击任务名或任务条可切换上下文）"
+        :disabled="tasks.length === 0"
+        @click="scrollToContextTaskEnd"
+      >
+        本条结束
+      </button>
+      <button
+        type="button"
+        class="btn"
+        title="滚动到列表中下一任务的开始日，并把上下文切到该任务"
+        :disabled="!canScrollToNextTaskStart()"
+        @click="scrollToNextTaskStart"
+      >
+        下一条开始
+      </button>
       <button type="button" class="btn primary" @click="addTask">添加任务</button>
     </section>
 
@@ -539,7 +823,7 @@ onMounted(() => {
     </section>
     <p v-if="ioMessage" class="io-msg" role="status">{{ ioMessage }}</p>
 
-    <div v-if="days.length === 0" class="empty">请设置有效的起始与结束日期。</div>
+    <div v-if="days.length === 0" class="empty">时间轴暂不可用，请刷新页面重试。</div>
 
     <div v-else class="gantt-body">
       <div class="label-col">
@@ -550,7 +834,8 @@ onMounted(() => {
           class="label-row"
           :class="{
             'is-row-dragging': rowReorderFromIndex === idx,
-            'row-drag-over': rowReorderOverIndex === idx && rowReorderFromIndex !== idx
+            'row-drag-over': rowReorderOverIndex === idx && rowReorderFromIndex !== idx,
+            'is-nav-context': isNavContextRow(task.id)
           }"
           @dragover.prevent="onRowDragOver(idx)"
           @drop.prevent="onRowDrop(idx)"
@@ -571,6 +856,7 @@ onMounted(() => {
             type="text"
             class="title-inp"
             placeholder="任务名称"
+            @focus="setNavContextTask(task.id)"
             @blur="saveState"
           />
           <button type="button" class="icon-btn" aria-label="删除任务" @click="removeTask(task.id)">
@@ -578,7 +864,7 @@ onMounted(() => {
           </button>
         </div>
       </div>
-      <div ref="scrollXRef" class="scroll-x">
+      <div ref="scrollXRef" class="scroll-x" @scroll.passive="onScrollTimeline">
         <div class="timeline-header" :style="{ width: `${timelineWidthPx}px` }">
           <div
             v-for="d in days"
@@ -596,7 +882,8 @@ onMounted(() => {
           class="track-row"
           :class="{
             'is-row-dragging': rowReorderFromIndex === idx,
-            'row-drag-over': rowReorderOverIndex === idx && rowReorderFromIndex !== idx
+            'row-drag-over': rowReorderOverIndex === idx && rowReorderFromIndex !== idx,
+            'is-nav-context': isNavContextRow(task.id)
           }"
           :style="{ width: `${timelineWidthPx}px` }"
           @dragover.prevent="onRowDragOver(idx)"
@@ -612,6 +899,7 @@ onMounted(() => {
           </div>
           <div
             class="bar"
+            :title="barTooltip(task)"
             :style="{
               left: `${barLeftPx(task)}px`,
               width: `${barWidthPx(task)}px`,
@@ -625,7 +913,7 @@ onMounted(() => {
               aria-label="拖动调整开始日期"
               @pointerdown.stop="(e) => onBarPointerDown(e, task, 'resize-left')"
             />
-            <span class="bar-label">{{ task.title }}</span>
+            <span class="bar-label">{{ barInlineLabel(task) }}</span>
             <button
               type="button"
               class="handle right"
@@ -727,6 +1015,15 @@ onMounted(() => {
   background: var(--color-background-mute);
 }
 
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn:disabled:hover {
+  background: var(--color-background-soft);
+}
+
 .io-bar {
   display: flex;
   flex-wrap: wrap;
@@ -806,6 +1103,11 @@ onMounted(() => {
 .track-row.row-drag-over {
   box-shadow: inset 0 3px 0 0 var(--color-border-hover);
   background: var(--color-background-mute);
+}
+
+.label-row.is-nav-context,
+.track-row.is-nav-context {
+  box-shadow: inset 3px 0 0 0 var(--color-border-hover);
 }
 
 .drag-row-handle {
